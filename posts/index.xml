@@ -1,4 +1,32 @@
-<?xml version="1.0" encoding="utf-8" standalone="yes"?><rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/"><channel><title>Posts on 凝紫暮</title><link>https://zamaoxiaoji.github.io/posts/</link><description>Recent content in Posts on 凝紫暮</description><generator>Hugo -- 0.150.0</generator><language>en-us</language><lastBuildDate>Sun, 14 Sep 2025 00:07:06 +0800</lastBuildDate><atom:link href="https://zamaoxiaoji.github.io/posts/index.xml" rel="self" type="application/rss+xml"/><item><title>Valueof和tostring区别</title><link>https://zamaoxiaoji.github.io/posts/valueof%E5%92%8Ctostring%E5%8C%BA%E5%88%AB/</link><pubDate>Sun, 14 Sep 2025 00:07:06 +0800</pubDate><guid>https://zamaoxiaoji.github.io/posts/valueof%E5%92%8Ctostring%E5%8C%BA%E5%88%AB/</guid><description>&lt;p&gt;LC49 String.valueOf(c) 换成c.toString()就出错&lt;/p&gt;
+<?xml version="1.0" encoding="utf-8" standalone="yes"?><rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/"><channel><title>Posts on 凝紫暮</title><link>https://zamaoxiaoji.github.io/posts/</link><description>Recent content in Posts on 凝紫暮</description><generator>Hugo -- 0.150.0</generator><language>en-us</language><lastBuildDate>Wed, 15 Oct 2025 22:23:13 +0800</lastBuildDate><atom:link href="https://zamaoxiaoji.github.io/posts/index.xml" rel="self" type="application/rss+xml"/><item><title>MINIOB算子实现流程</title><link>https://zamaoxiaoji.github.io/posts/miniob%E7%AE%97%E5%AD%90%E5%AE%9E%E7%8E%B0%E6%B5%81%E7%A8%8B/</link><pubDate>Wed, 15 Oct 2025 22:23:13 +0800</pubDate><guid>https://zamaoxiaoji.github.io/posts/miniob%E7%AE%97%E5%AD%90%E5%AE%9E%E7%8E%B0%E6%B5%81%E7%A8%8B/</guid><description>&lt;h1 id="0-脑子里要有的总地图一次过"&gt;0. 脑子里要有的总地图（一次过）&lt;/h1&gt;
+&lt;p&gt;SQL 的执行在 miniob 里基本是这几步（你也已经知道的那条线）：&lt;/p&gt;
+&lt;p&gt;Parser&lt;/p&gt;
+&lt;p&gt;词法/语法把 SQL 字符串变成解析树（ParsedSqlNode，比如 SelectSqlNode）。&lt;/p&gt;
+&lt;p&gt;Resolver（绑定/类型解析）&lt;/p&gt;
+&lt;p&gt;把未绑定的表达式（比如 UnboundFieldExpr、UnboundAggregateExpr）变成可执行的表达式（FieldExpr、AggregateExpr），决定类型、长度，必要时做 cast。&lt;/p&gt;
+&lt;p&gt;Logical Plan（逻辑算子）&lt;/p&gt;
+&lt;p&gt;基于 SelectSqlNode 搭建逻辑计划：扫描、谓词、投影、聚合、分组、连接等。这里只决定“做什么”，还没决定“怎么做/用什么算法”。&lt;/p&gt;
+&lt;p&gt;Physical Plan（物理算子）&lt;/p&gt;
+&lt;p&gt;选择具体实现（比如 GROUP_BY_VEC、AGGREGATE_VEC、HASH_JOIN…），实现 open/next/close 的迭代器接口。&lt;/p&gt;
+&lt;p&gt;miniob 的物理算子是向量化风格：next(Chunk &amp;amp;chunk) 每次吐一批数据列（Column），而不是一行行吐。&lt;/p&gt;
+&lt;p&gt;执行（Executor）&lt;/p&gt;
+&lt;p&gt;从根算子开始 open()，不断 next() 直到 RECORD_EOF，最后 close()。&lt;/p&gt;
+&lt;p&gt;接下来每一步用已经改的代码把“做了什么”和“为什么这么做”讲清楚。&lt;/p&gt;
+&lt;h1 id="1-parser让-sql-能写出来并被理解"&gt;1. Parser：让 SQL 能“写出来并被理解”&lt;/h1&gt;
+&lt;h2 id="11-语法在-yacc_sqly-支持聚合与-group-by"&gt;1.1 语法：在 yacc_sql.y 支持聚合与 GROUP BY&lt;/h2&gt;
+&lt;p&gt;已经有：&lt;/p&gt;
+&lt;p&gt;aggregate_expression：&lt;/p&gt;
+&lt;pre tabindex="0"&gt;&lt;code&gt;aggregate_expression:
+ID LBRACE expression RBRACE {
+$$ = create_aggregate_expression($1, $3, sql_string, &amp;amp;@$);
+}
+| ID LBRACE &amp;#39;*&amp;#39; RBRACE {
+$$ = create_aggregate_expression($1, new StarExpr(), sql_string, &amp;amp;@$);
+}
+;
+&lt;/code&gt;&lt;/pre&gt;&lt;p&gt;这让 COUNT(*) / SUM(col) / AVG(col) 等进入解析树里，先是 Unbound（UnboundAggregateExpr），类型还没最终确认（语义阶段做）。
+group_by：
+你可以用“语义阶段禁 *”或“语法直接禁 *”两种方案之一。我们给了“语法直接禁 &lt;em&gt;”的版本（group_by_expression 不包含 &amp;lsquo;&lt;/em&gt;&amp;rsquo; 和 aggregate_expression），这样 GROUP BY 列就不会接受 * 或聚合。&lt;/p&gt;</description></item><item><title>Valueof和tostring区别</title><link>https://zamaoxiaoji.github.io/posts/valueof%E5%92%8Ctostring%E5%8C%BA%E5%88%AB/</link><pubDate>Sun, 14 Sep 2025 00:07:06 +0800</pubDate><guid>https://zamaoxiaoji.github.io/posts/valueof%E5%92%8Ctostring%E5%8C%BA%E5%88%AB/</guid><description>&lt;p&gt;LC49 String.valueOf(c) 换成c.toString()就出错&lt;/p&gt;
 &lt;p&gt;在 Java 里，这两个方法表面相似，但本质完全不同：&lt;/p&gt;
 &lt;ol&gt;
 &lt;li&gt;String.valueOf(c)&lt;/li&gt;

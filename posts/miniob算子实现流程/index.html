@@ -1,0 +1,128 @@
+<!doctype html><html lang=en dir=auto><head><meta charset=utf-8><meta http-equiv=X-UA-Compatible content="IE=edge"><meta name=viewport content="width=device-width,initial-scale=1,shrink-to-fit=no"><meta name=robots content="index, follow"><title>MINIOB算子实现流程 | 凝紫暮</title><meta name=keywords content><meta name=description content="0. 脑子里要有的总地图（一次过）
+SQL 的执行在 miniob 里基本是这几步（你也已经知道的那条线）：
+Parser
+词法/语法把 SQL 字符串变成解析树（ParsedSqlNode，比如 SelectSqlNode）。
+Resolver（绑定/类型解析）
+把未绑定的表达式（比如 UnboundFieldExpr、UnboundAggregateExpr）变成可执行的表达式（FieldExpr、AggregateExpr），决定类型、长度，必要时做 cast。
+Logical Plan（逻辑算子）
+基于 SelectSqlNode 搭建逻辑计划：扫描、谓词、投影、聚合、分组、连接等。这里只决定“做什么”，还没决定“怎么做/用什么算法”。
+Physical Plan（物理算子）
+选择具体实现（比如 GROUP_BY_VEC、AGGREGATE_VEC、HASH_JOIN…），实现 open/next/close 的迭代器接口。
+miniob 的物理算子是向量化风格：next(Chunk &amp;chunk) 每次吐一批数据列（Column），而不是一行行吐。
+执行（Executor）
+从根算子开始 open()，不断 next() 直到 RECORD_EOF，最后 close()。
+接下来每一步用已经改的代码把“做了什么”和“为什么这么做”讲清楚。
+1. Parser：让 SQL 能“写出来并被理解”
+1.1 语法：在 yacc_sql.y 支持聚合与 GROUP BY
+已经有：
+aggregate_expression：
+aggregate_expression:
+    ID LBRACE expression RBRACE {
+      $$ = create_aggregate_expression($1, $3, sql_string, &@$);
+    }
+  | ID LBRACE '*' RBRACE {
+      $$ = create_aggregate_expression($1, new StarExpr(), sql_string, &@$);
+    }
+  ;
+这让 COUNT(*) / SUM(col) / AVG(col) 等进入解析树里，先是 Unbound（UnboundAggregateExpr），类型还没最终确认（语义阶段做）。
+group_by：
+你可以用“语义阶段禁 *”或“语法直接禁 *”两种方案之一。我们给了“语法直接禁 ”的版本（group_by_expression 不包含 &lsquo;&rsquo; 和 aggregate_expression），这样 GROUP BY 列就不会接受 * 或聚合。"><meta name=author content><link rel=canonical href=https://zamaoxiaoji.github.io/posts/miniob%E7%AE%97%E5%AD%90%E5%AE%9E%E7%8E%B0%E6%B5%81%E7%A8%8B/><link crossorigin=anonymous href=/assets/css/stylesheet.2211ca3164be7830024f6aad2b3a2e520843a64f8f048445c3401c1249aa051d.css integrity="sha256-IhHKMWS+eDACT2qtKzouUghDpk+PBIRFw0AcEkmqBR0=" rel="preload stylesheet" as=style><link rel=icon href=https://zamaoxiaoji.github.io/favicon.ico><link rel=icon type=image/png sizes=16x16 href=https://zamaoxiaoji.github.io/favicon-16x16.png><link rel=icon type=image/png sizes=32x32 href=https://zamaoxiaoji.github.io/favicon-32x32.png><link rel=apple-touch-icon href=https://zamaoxiaoji.github.io/apple-touch-icon.png><link rel=mask-icon href=https://zamaoxiaoji.github.io/safari-pinned-tab.svg><meta name=theme-color content="#2e2e33"><meta name=msapplication-TileColor content="#2e2e33"><link rel=alternate hreflang=en href=https://zamaoxiaoji.github.io/posts/miniob%E7%AE%97%E5%AD%90%E5%AE%9E%E7%8E%B0%E6%B5%81%E7%A8%8B/><noscript><style>#theme-toggle,.top-link{display:none}</style><style>@media(prefers-color-scheme:dark){:root{--theme:rgb(29, 30, 32);--entry:rgb(46, 46, 51);--primary:rgb(218, 218, 219);--secondary:rgb(155, 156, 157);--tertiary:rgb(65, 66, 68);--content:rgb(196, 196, 197);--code-block-bg:rgb(46, 46, 51);--code-bg:rgb(55, 56, 62);--border:rgb(51, 51, 51)}.list{background:var(--theme)}.list:not(.dark)::-webkit-scrollbar-track{background:0 0}.list:not(.dark)::-webkit-scrollbar-thumb{border-color:var(--theme)}}</style></noscript><meta property="og:url" content="https://zamaoxiaoji.github.io/posts/miniob%E7%AE%97%E5%AD%90%E5%AE%9E%E7%8E%B0%E6%B5%81%E7%A8%8B/"><meta property="og:site_name" content="凝紫暮"><meta property="og:title" content="MINIOB算子实现流程"><meta property="og:description" content="0. 脑子里要有的总地图（一次过） SQL 的执行在 miniob 里基本是这几步（你也已经知道的那条线）：
+Parser
+词法/语法把 SQL 字符串变成解析树（ParsedSqlNode，比如 SelectSqlNode）。
+Resolver（绑定/类型解析）
+把未绑定的表达式（比如 UnboundFieldExpr、UnboundAggregateExpr）变成可执行的表达式（FieldExpr、AggregateExpr），决定类型、长度，必要时做 cast。
+Logical Plan（逻辑算子）
+基于 SelectSqlNode 搭建逻辑计划：扫描、谓词、投影、聚合、分组、连接等。这里只决定“做什么”，还没决定“怎么做/用什么算法”。
+Physical Plan（物理算子）
+选择具体实现（比如 GROUP_BY_VEC、AGGREGATE_VEC、HASH_JOIN…），实现 open/next/close 的迭代器接口。
+miniob 的物理算子是向量化风格：next(Chunk &amp;chunk) 每次吐一批数据列（Column），而不是一行行吐。
+执行（Executor）
+从根算子开始 open()，不断 next() 直到 RECORD_EOF，最后 close()。
+接下来每一步用已经改的代码把“做了什么”和“为什么这么做”讲清楚。
+1. Parser：让 SQL 能“写出来并被理解” 1.1 语法：在 yacc_sql.y 支持聚合与 GROUP BY 已经有：
+aggregate_expression：
+aggregate_expression: ID LBRACE expression RBRACE { $$ = create_aggregate_expression($1, $3, sql_string, &@$); } | ID LBRACE '*' RBRACE { $$ = create_aggregate_expression($1, new StarExpr(), sql_string, &@$); } ; 这让 COUNT(*) / SUM(col) / AVG(col) 等进入解析树里，先是 Unbound（UnboundAggregateExpr），类型还没最终确认（语义阶段做）。 group_by： 你可以用“语义阶段禁 *”或“语法直接禁 *”两种方案之一。我们给了“语法直接禁 ”的版本（group_by_expression 不包含 ‘’ 和 aggregate_expression），这样 GROUP BY 列就不会接受 * 或聚合。"><meta property="og:locale" content="en-us"><meta property="og:type" content="article"><meta property="article:section" content="posts"><meta property="article:published_time" content="2025-10-15T22:23:13+08:00"><meta property="article:modified_time" content="2025-10-15T22:23:13+08:00"><meta name=twitter:card content="summary"><meta name=twitter:title content="MINIOB算子实现流程"><meta name=twitter:description content="0. 脑子里要有的总地图（一次过）
+SQL 的执行在 miniob 里基本是这几步（你也已经知道的那条线）：
+Parser
+词法/语法把 SQL 字符串变成解析树（ParsedSqlNode，比如 SelectSqlNode）。
+Resolver（绑定/类型解析）
+把未绑定的表达式（比如 UnboundFieldExpr、UnboundAggregateExpr）变成可执行的表达式（FieldExpr、AggregateExpr），决定类型、长度，必要时做 cast。
+Logical Plan（逻辑算子）
+基于 SelectSqlNode 搭建逻辑计划：扫描、谓词、投影、聚合、分组、连接等。这里只决定“做什么”，还没决定“怎么做/用什么算法”。
+Physical Plan（物理算子）
+选择具体实现（比如 GROUP_BY_VEC、AGGREGATE_VEC、HASH_JOIN…），实现 open/next/close 的迭代器接口。
+miniob 的物理算子是向量化风格：next(Chunk &amp;chunk) 每次吐一批数据列（Column），而不是一行行吐。
+执行（Executor）
+从根算子开始 open()，不断 next() 直到 RECORD_EOF，最后 close()。
+接下来每一步用已经改的代码把“做了什么”和“为什么这么做”讲清楚。
+1. Parser：让 SQL 能“写出来并被理解”
+1.1 语法：在 yacc_sql.y 支持聚合与 GROUP BY
+已经有：
+aggregate_expression：
+aggregate_expression:
+    ID LBRACE expression RBRACE {
+      $$ = create_aggregate_expression($1, $3, sql_string, &@$);
+    }
+  | ID LBRACE '*' RBRACE {
+      $$ = create_aggregate_expression($1, new StarExpr(), sql_string, &@$);
+    }
+  ;
+这让 COUNT(*) / SUM(col) / AVG(col) 等进入解析树里，先是 Unbound（UnboundAggregateExpr），类型还没最终确认（语义阶段做）。
+group_by：
+你可以用“语义阶段禁 *”或“语法直接禁 *”两种方案之一。我们给了“语法直接禁 ”的版本（group_by_expression 不包含 &lsquo;&rsquo; 和 aggregate_expression），这样 GROUP BY 列就不会接受 * 或聚合。"><script type=application/ld+json>{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Posts","item":"https://zamaoxiaoji.github.io/posts/"},{"@type":"ListItem","position":2,"name":"MINIOB算子实现流程","item":"https://zamaoxiaoji.github.io/posts/miniob%E7%AE%97%E5%AD%90%E5%AE%9E%E7%8E%B0%E6%B5%81%E7%A8%8B/"}]}</script><script type=application/ld+json>{"@context":"https://schema.org","@type":"BlogPosting","headline":"MINIOB算子实现流程","name":"MINIOB算子实现流程","description":"0. 脑子里要有的总地图（一次过） SQL 的执行在 miniob 里基本是这几步（你也已经知道的那条线）：\nParser\n词法/语法把 SQL 字符串变成解析树（ParsedSqlNode，比如 SelectSqlNode）。\nResolver（绑定/类型解析）\n把未绑定的表达式（比如 UnboundFieldExpr、UnboundAggregateExpr）变成可执行的表达式（FieldExpr、AggregateExpr），决定类型、长度，必要时做 cast。\nLogical Plan（逻辑算子）\n基于 SelectSqlNode 搭建逻辑计划：扫描、谓词、投影、聚合、分组、连接等。这里只决定“做什么”，还没决定“怎么做/用什么算法”。\nPhysical Plan（物理算子）\n选择具体实现（比如 GROUP_BY_VEC、AGGREGATE_VEC、HASH_JOIN…），实现 open/next/close 的迭代器接口。\nminiob 的物理算子是向量化风格：next(Chunk \u0026amp;chunk) 每次吐一批数据列（Column），而不是一行行吐。\n执行（Executor）\n从根算子开始 open()，不断 next() 直到 RECORD_EOF，最后 close()。\n接下来每一步用已经改的代码把“做了什么”和“为什么这么做”讲清楚。\n1. Parser：让 SQL 能“写出来并被理解” 1.1 语法：在 yacc_sql.y 支持聚合与 GROUP BY 已经有：\naggregate_expression：\naggregate_expression: ID LBRACE expression RBRACE { $$ = create_aggregate_expression($1, $3, sql_string, \u0026amp;@$); } | ID LBRACE \u0026#39;*\u0026#39; RBRACE { $$ = create_aggregate_expression($1, new StarExpr(), sql_string, \u0026amp;@$); } ; 这让 COUNT(*) / SUM(col) / AVG(col) 等进入解析树里，先是 Unbound（UnboundAggregateExpr），类型还没最终确认（语义阶段做）。 group_by： 你可以用“语义阶段禁 *”或“语法直接禁 *”两种方案之一。我们给了“语法直接禁 ”的版本（group_by_expression 不包含 \u0026lsquo;\u0026rsquo; 和 aggregate_expression），这样 GROUP BY 列就不会接受 * 或聚合。\n","keywords":[],"articleBody":"0. 脑子里要有的总地图（一次过） SQL 的执行在 miniob 里基本是这几步（你也已经知道的那条线）：\nParser\n词法/语法把 SQL 字符串变成解析树（ParsedSqlNode，比如 SelectSqlNode）。\nResolver（绑定/类型解析）\n把未绑定的表达式（比如 UnboundFieldExpr、UnboundAggregateExpr）变成可执行的表达式（FieldExpr、AggregateExpr），决定类型、长度，必要时做 cast。\nLogical Plan（逻辑算子）\n基于 SelectSqlNode 搭建逻辑计划：扫描、谓词、投影、聚合、分组、连接等。这里只决定“做什么”，还没决定“怎么做/用什么算法”。\nPhysical Plan（物理算子）\n选择具体实现（比如 GROUP_BY_VEC、AGGREGATE_VEC、HASH_JOIN…），实现 open/next/close 的迭代器接口。\nminiob 的物理算子是向量化风格：next(Chunk \u0026chunk) 每次吐一批数据列（Column），而不是一行行吐。\n执行（Executor）\n从根算子开始 open()，不断 next() 直到 RECORD_EOF，最后 close()。\n接下来每一步用已经改的代码把“做了什么”和“为什么这么做”讲清楚。\n1. Parser：让 SQL 能“写出来并被理解” 1.1 语法：在 yacc_sql.y 支持聚合与 GROUP BY 已经有：\naggregate_expression：\naggregate_expression: ID LBRACE expression RBRACE { $$ = create_aggregate_expression($1, $3, sql_string, \u0026@$); } | ID LBRACE '*' RBRACE { $$ = create_aggregate_expression($1, new StarExpr(), sql_string, \u0026@$); } ; 这让 COUNT(*) / SUM(col) / AVG(col) 等进入解析树里，先是 Unbound（UnboundAggregateExpr），类型还没最终确认（语义阶段做）。 group_by： 你可以用“语义阶段禁 *”或“语法直接禁 *”两种方案之一。我们给了“语法直接禁 ”的版本（group_by_expression 不包含 ‘’ 和 aggregate_expression），这样 GROUP BY 列就不会接受 * 或聚合。\n1.2 解析树：ParsedSqlNode / SelectSqlNode 在 parse_defs.h 你看到：\nstruct SelectSqlNode { vector","wordCount":"695","inLanguage":"en","datePublished":"2025-10-15T22:23:13+08:00","dateModified":"2025-10-15T22:23:13+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://zamaoxiaoji.github.io/posts/miniob%E7%AE%97%E5%AD%90%E5%AE%9E%E7%8E%B0%E6%B5%81%E7%A8%8B/"},"publisher":{"@type":"Organization","name":"凝紫暮","logo":{"@type":"ImageObject","url":"https://zamaoxiaoji.github.io/favicon.ico"}}}</script></head><body id=top><script>localStorage.getItem("pref-theme")==="dark"?document.body.classList.add("dark"):localStorage.getItem("pref-theme")==="light"?document.body.classList.remove("dark"):window.matchMedia("(prefers-color-scheme: dark)").matches&&document.body.classList.add("dark")</script><header class=header><nav class=nav><div class=logo><a href=https://zamaoxiaoji.github.io/ accesskey=h title="凝紫暮 (Alt + H)">凝紫暮</a><div class=logo-switches><button id=theme-toggle accesskey=t title="(Alt + T)" aria-label="Toggle theme">
+<svg id="moon" width="24" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg>
+<svg id="sun" width="24" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg></button></div></div><ul id=menu></ul></nav></header><main class=main><article class=post-single><header class=post-header><h1 class="post-title entry-hint-parent">MINIOB算子实现流程</h1><div class=post-meta><span title='2025-10-15 22:23:13 +0800 +0800'>October 15, 2025</span></div></header><div class=post-content><h1 id=0-脑子里要有的总地图一次过>0. 脑子里要有的总地图（一次过）<a hidden class=anchor aria-hidden=true href=#0-脑子里要有的总地图一次过>#</a></h1><p>SQL 的执行在 miniob 里基本是这几步（你也已经知道的那条线）：</p><p>Parser</p><p>词法/语法把 SQL 字符串变成解析树（ParsedSqlNode，比如 SelectSqlNode）。</p><p>Resolver（绑定/类型解析）</p><p>把未绑定的表达式（比如 UnboundFieldExpr、UnboundAggregateExpr）变成可执行的表达式（FieldExpr、AggregateExpr），决定类型、长度，必要时做 cast。</p><p>Logical Plan（逻辑算子）</p><p>基于 SelectSqlNode 搭建逻辑计划：扫描、谓词、投影、聚合、分组、连接等。这里只决定“做什么”，还没决定“怎么做/用什么算法”。</p><p>Physical Plan（物理算子）</p><p>选择具体实现（比如 GROUP_BY_VEC、AGGREGATE_VEC、HASH_JOIN…），实现 open/next/close 的迭代器接口。</p><p>miniob 的物理算子是向量化风格：next(Chunk &amp;chunk) 每次吐一批数据列（Column），而不是一行行吐。</p><p>执行（Executor）</p><p>从根算子开始 open()，不断 next() 直到 RECORD_EOF，最后 close()。</p><p>接下来每一步用已经改的代码把“做了什么”和“为什么这么做”讲清楚。</p><h1 id=1-parser让-sql-能写出来并被理解>1. Parser：让 SQL 能“写出来并被理解”<a hidden class=anchor aria-hidden=true href=#1-parser让-sql-能写出来并被理解>#</a></h1><h2 id=11-语法在-yacc_sqly-支持聚合与-group-by>1.1 语法：在 yacc_sql.y 支持聚合与 GROUP BY<a hidden class=anchor aria-hidden=true href=#11-语法在-yacc_sqly-支持聚合与-group-by>#</a></h2><p>已经有：</p><p>aggregate_expression：</p><pre tabindex=0><code>aggregate_expression:
+    ID LBRACE expression RBRACE {
+      $$ = create_aggregate_expression($1, $3, sql_string, &amp;@$);
+    }
+  | ID LBRACE &#39;*&#39; RBRACE {
+      $$ = create_aggregate_expression($1, new StarExpr(), sql_string, &amp;@$);
+    }
+  ;
+</code></pre><p>这让 COUNT(*) / SUM(col) / AVG(col) 等进入解析树里，先是 Unbound（UnboundAggregateExpr），类型还没最终确认（语义阶段做）。
+group_by：
+你可以用“语义阶段禁 *”或“语法直接禁 *”两种方案之一。我们给了“语法直接禁 <em>”的版本（group_by_expression 不包含 &lsquo;</em>&rsquo; 和 aggregate_expression），这样 GROUP BY 列就不会接受 * 或聚合。</p><h2 id=12-解析树parsedsqlnode--selectsqlnode>1.2 解析树：ParsedSqlNode / SelectSqlNode<a hidden class=anchor aria-hidden=true href=#12-解析树parsedsqlnode--selectsqlnode>#</a></h2><p>在 parse_defs.h 你看到：</p><pre tabindex=0><code>struct SelectSqlNode {
+  vector&lt;unique_ptr&lt;Expression&gt;&gt; expressions;  // SELECT 列（表达式）
+  vector&lt;string&gt;                 relations;    // FROM 表
+  vector&lt;ConditionSqlNode&gt;       conditions;   // WHERE
+  vector&lt;unique_ptr&lt;Expression&gt;&gt; group_by;     // GROUP BY
+};
+</code></pre><p>这一步的职责是：把 SQL 文本“抄写”成一棵结构化的语法树，表达式是 Expression* 的抽象（此时可能是 UnboundFieldExpr、UnboundAggregateExpr、ArithmeticExpr…）。</p><p>重点：Parser 阶段不检查业务规则（比如 SUM(*) 是否允许），它的目标是“尽量把语法树搭起来”；真正的限制交给 resolver/语义分析。</p><h1 id=2-resolver把未绑定表达式变成可执行表达式>2. Resolver：把“未绑定表达式”变成“可执行表达式”<a hidden class=anchor aria-hidden=true href=#2-resolver把未绑定表达式变成可执行表达式>#</a></h1><p>你给的 expression.h 里，有一对“未绑定/已绑定”的类型：</p><p>未绑定：UnboundFieldExpr、UnboundAggregateExpr</p><p>已绑定：FieldExpr（持有 Field，知道 table/column 与类型长度）、AggregateExpr（知道聚合类型/返回类型，比如 COUNT -> INTS、AVG -> FLOATS）</p><p>Resolver 的典型工作（伪代码示意）：</p><pre tabindex=0><code>Expression* bind(Expression *e, const FromInfo &amp;from) {
+  switch (e-&gt;type()) {
+    case ExprType::UNBOUND_FIELD: {
+      auto *u = static_cast&lt;UnboundFieldExpr*&gt;(e);
+      const Field &amp;f = resolve_field(u-&gt;table_name(), u-&gt;field_name(), from);
+      return new FieldExpr(f);  // 绑定字段 → 类型/长度明确
+    }
+    case ExprType::UNBOUND_AGGREGATION: {
+      auto *u = static_cast&lt;UnboundAggregateExpr*&gt;(e);
+      AggregateExpr::Type t = parse_agg_name(u-&gt;aggregate_name()); // COUNT/SUM/...
+      unique_ptr&lt;Expression&gt; child(bind(u-&gt;child().get(), from));
+      // 可在这儿检查 SUM(*) 合不合规，COUNT(*) 的 child 是否 StarExpr 等
+      return new AggregateExpr(t, std::move(child));
+    }
+    case ExprType::ARITHMETIC: { ... 递归 bind 左右子树，做类型提升/CAST ... }
+    ...
+  }
+}
+</code></pre><p>为什么要绑定？</p><p>执行时必须知道每个表达式的值类型（value_type()）、长度（value_length()）。你看 AggregateExpr::value_type()：COUNT->INTS，AVG->FLOATS，其余跟 child 一样。</p><p>绑定还会把 Unbound* 换成能 get_value/ get_column 的表达式。比如 FieldExpr::get_column 会直接从 Chunk 里拎列；AggregateExpr 在向量化管线里通常由专门算子计算。</p><p>补充：Expression::pos() 的含义</p><p>某些表达式会在下层算子中就计算好，并把结果作为一列放进 Chunk；这时上层拿到表达式时可以检查 pos()，如果 >=0，说明在输入 Chunk 的那一列已经有结果，无需重复算。</p><p>聚合常常是上层算子算的（例如 GROUP_BY_VEC/AGGREGATE_VEC），所以它们的 pos() 由上层产出后再设置。</p><h1 id=3-logical-plan决定做什么>3. Logical Plan：决定“做什么”<a hidden class=anchor aria-hidden=true href=#3-logical-plan决定做什么>#</a></h1><p>基于 SelectSqlNode，逻辑计划会识别：</p><p>没有 GROUP BY 但有聚合 → “全局聚合”</p><p>有 GROUP BY → “分组聚合”</p><p>没有聚合 → 普通投影/筛选/连接</p><p>逻辑节点不关心算法，只关心语义。例如它会有 “GroupBy( keys=[…], aggs=[…] )” 这样的抽象节点。</p><h1 id=4-physical-plan决定怎么做--用哪个算子>4. Physical Plan：决定“怎么做 & 用哪个算子”<a hidden class=anchor aria-hidden=true href=#4-physical-plan决定怎么做--用哪个算子>#</a></h1><p>miniob 已经有两条路：</p><p>全局聚合（无 GROUP BY）：AggregateVecPhysicalOperator
+你贴的 aggregate_vec_physical_operator.cpp 就是它——把所有输入当成一个组，聚合成一行输出。</p><p>分组聚合（GROUP BY）：GroupByVecPhysicalOperator
+我给你的 .h/.cpp 实现，就是哈希分组 + 分组内聚合，输出多行（每组一行）。</p><h2 id=41-物理算子的通用接口>4.1 物理算子的通用接口<a hidden class=anchor aria-hidden=true href=#41-物理算子的通用接口>#</a></h2><p>每个算子都要实现：</p><pre tabindex=0><code>RC open(Trx *trx);
+RC next(Chunk &amp;chunk);  // 向量化：一次吐一批列
+RC close();
+</code></pre><p>执行时框架会：</p><pre tabindex=0><code>root-&gt;open(trx);
+while (root-&gt;next(output_chunk) == RC::SUCCESS) { ...消费... }
+root-&gt;close();
+</code></pre><h2 id=42-全局聚合你现成那份>4.2 全局聚合（你现成那份）<a hidden class=anchor aria-hidden=true href=#42-全局聚合你现成那份>#</a></h2><p>AggregateVecPhysicalOperator 的关键点：</p><p>构造里：为每个聚合创建 state_ptr（create_aggregate_state），准备输出列</p><p>open()：循环 child->next(chunk_)，用 value_expressions_[i]->get_column(chunk_, col) 得到每个聚合的输入列，把整列喂给 aggregate_state_update_by_column(state, type, child_type, col) 做批量累积</p><p>next()：把每个 state finalize 到 output_chunk_，只吐一次（一行），下次就是 RECORD_EOF</p><p>这就是“全局聚合只有一个组”的版本。</p><h2 id=43-分组聚合我们新写的>4.3 分组聚合（我们新写的）<a hidden class=anchor aria-hidden=true href=#43-分组聚合我们新写的>#</a></h2><p>GroupByVecPhysicalOperator 的职责：</p><p>open()：</p><p>一直从 child 拉批：</p><p>计算分组键列 → groups_chunk</p><p>计算聚合输入列（每个聚合的 child）→ aggrs_chunk</p><p>hash_table_->add_chunk(groups_chunk, aggrs_chunk)</p><p>构建扫描器（AggregateHashTable::Scanner）用于按组吐结果</p><p>next()：</p><p>scanner_->next(chunk)：把若干分组的“分组键 + 聚合结果”写到一个 chunk 里</p><p>close()：</p><p>关闭 child，销毁扫描器/哈希表（state 也被释放）</p><p>你已经有 AggregateHashTable 的抽象和一个标准实现 StandardAggregateHashTable，我们只需要把 add_chunk 和 Scanner 的输出写完整，它会管理 “key -> state[]” 这件事。</p><h1 id=5-聚合哈希表把多行多组累积成每组一行的结果>5. 聚合哈希表：把“多行多组”累积成“每组一行”的结果<a hidden class=anchor aria-hidden=true href=#5-聚合哈希表把多行多组累积成每组一行的结果>#</a></h1><p>你给的头文件已经定义好了接口：</p><pre tabindex=0><code>class AggregateHashTable {
+public:
+  virtual RC add_chunk(Chunk &amp;groups_chunk, Chunk &amp;aggrs_chunk) = 0;
+  class Scanner { virtual RC next(Chunk &amp;chunk) = 0; ... };
+  vector&lt;AggregateExpr::Type&gt; aggr_types_;
+  vector&lt;AttrType&gt;            aggr_child_types_;
+};
+</code></pre><p>StandardAggregateHashTable 的核心是：</p><pre tabindex=0><code>unordered_map&lt;vector&lt;Value&gt;, vector&lt;void *&gt;&gt; aggr_values_;
+</code></pre><p>key = 该行的分组键（按列取第 i 行得到 Value，合成 vector）</p><p>value = 这组的聚合 state 指针数组（每个聚合一个）</p><h2 id=51-add_chunk把一批-rows-落进哈希表>5.1 add_chunk（把一批 rows 落进哈希表）<a hidden class=anchor aria-hidden=true href=#51-add_chunk把一批-rows-落进哈希表>#</a></h2><p>思路：</p><p>对 groups_chunk 和 aggrs_chunk，先取行数 n（一般两者相等等于子算子吐出的批大小）</p><p>for i in [0..n)：</p><p>组装 key：对每个 group-by 列取第 i 个 Value → 拼成 vector</p><p>查哈希表：</p><p>首次遇到该 key：vector&lt;void*> states(aggr_types_.size())，对每个聚合 create_aggregate_state(aggr_types_[k], aggr_child_types_[k])</p><p>然后把第 i 行对应聚合输入值更新到 state：</p><p>简单可靠的做法：把该输入列第 i 个元素做成“单元素视图”的 Column（或者直接构造 1 个元素的 Column），调用 aggregate_state_update_by_column(states[k], &mldr;)</p><p>也可以直接提供 “按单值更新”的 API（如果你们有的话）</p><p>实现要点：</p><p>Value 的相等与哈希要正确，VectorHash/VectorEqual 你们已经写了</p><p>state 的生命周期由哈希表析构统一 free（你们的析构里已经 free(state) 了）</p><h2 id=52-scannernext把分组结果吐成-chunk>5.2 Scanner::next（把分组结果吐成 Chunk）<a hidden class=anchor aria-hidden=true href=#52-scannernext把分组结果吐成-chunk>#</a></h2><p>思路：</p><p>维护一个迭代器（begin → end）</p><p>每次 next(chunk)：</p><p>清空并准备输出列：先把分组键列也建上（通常 SELECT 里要用到），再加聚合列</p><p>迭代若干组（你可以一次性全吐，也可以控制批大小）：</p><p>把 key 的每个 Value 写到对应键列的尾部一个单元</p><p>对每个聚合 finalize 把结果写到对应聚合列的尾部一个单元</p><p>移动迭代器；全部吐完时返回 RECORD_EOF</p><p>这和我们在 GroupByVecPhysicalOperator::next 里使用扫描器的契约一致。</p><h1 id=你写改这些代码时的心智模型>你写/改这些代码时的心智模型<a hidden class=anchor aria-hidden=true href=#你写改这些代码时的心智模型>#</a></h1><p>表达式（Expression）：谁来算、在哪一层算？</p><p>字段/算术/常量可以在子算子就算成列（get_column）；</p><p>聚合必须在聚合算子里算（AGGREGATE_VEC 或 GROUP_BY_VEC），不指望子算子提供它（除非上游做了预聚合）。</p><p>Chunk/Column 的流动：</p><p>每个算子接入一个或多个 child；</p><p>next(child_chunk) → 评估自己负责的表达式 → 产出新的列或引用已有列 → chunk.reference(&mldr;) 或 chunk.add_column(&mldr;)；</p><p>只要你理解“列是连续内存的一段数组，Chunk 是多列的并排集合”，就很容易写对。</p><p>state 的生命周期：</p><p>聚合 state 创建在 open/build 阶段，更新在读入批时，finalize 在吐结果的时候，最后在 close/析构回收。</p><p>全局聚合是一组 state；分组聚合是“很多组，每组有一组 state”。</p><h1 id=7-怎么验证自己没写歪最小自测集>7. 怎么验证自己没写歪（最小自测集）<a hidden class=anchor aria-hidden=true href=#7-怎么验证自己没写歪最小自测集>#</a></h1><p>解析 + 绑定能过：</p><p>SELECT COUNT(*) FROM t;</p><p>SELECT dept, AVG(salary) FROM emp GROUP BY dept;</p><p>SELECT DATE(ts), SUM(x) FROM tab GROUP BY DATE(ts);</p><p>运行结果行数/列数正确：</p><p>无 GROUP BY → 一行</p><p>有 GROUP BY → 组数行；键列 + 聚合列顺序正确</p><p>边界：</p><p>空输入：COUNT(*) = 0；SUM/AVG/MIN/MAX 的空组行为按你们 finalize 的约定（通常是 NULL/未定义）；</p><p>键为相同值的行都被归到同一组；</p><p>多键（两列分组）与表达式键（DATE(ts)）也生效。</p><h1 id=8-如果以后你要自己独立做一个新算子照这个配方走>8. 如果以后你要“自己独立做一个新算子”，照这个配方走<a hidden class=anchor aria-hidden=true href=#8-如果以后你要自己独立做一个新算子照这个配方走>#</a></h1><p>这是一个通用 Checklist（照抄就能落地）：</p><p>语法（可选，看算子类型）</p><p>在 yacc_sql.y 增加语法产出，必要时更新 l_sql.l 关键字</p><p>把新东西装进 ParsedSqlNode（或新建一个）</p><p>表达式/解析树</p><p>如果引入新表达式，先给出 Expression 的派生类定义（type()/value_type()/get_value()/get_column()）</p><p>决定哪些在解析阶段是 Unbound，哪些在 resolver 阶段绑定</p><p>Resolver（绑定/类型推导）</p><p>把 Unbound* 变成可执行表达式，做类型/长度决定与校验</p><p>把语义限制放在这里报错（比如 SUM(*) 不允许，GROUP BY * 不允许）</p><p>Logical Operator</p><p>定义逻辑节点（比如 Filter/Project/Aggregate/Join 等），能表达“要做什么”</p><p>在 builder 里根据 ParsedSqlNode 选择逻辑结构</p><p>Physical Operator</p><p>选择实现策略（向量化/算子组合/索引利用等），实现 open/next/close</p><p>约定好 Chunk 的输入输出列、表达式在哪一层计算</p><p>写必要的数据结构（比如 HashTable、状态机、临时缓冲）</p><p>执行/集成</p><p>把物理算子挂进物理计划器，保证 SELECT 走到你的算子</p><p>写自测 SQL，确认 EXPLAIN 能看到你的算子</p><p>性能/扩展（后续）</p><p>批处理、SIMD、内存复用、下推计算（把 pos() 设定好减少重复求值）</p><p>DISTINCT、NULL 语义、类型提升、溢出处理</p><h1 id=9-你现在手上的代码都在做什么和这套思路一一对上>9. 你现在手上的代码都在做什么（和这套思路一一对上）<a hidden class=anchor aria-hidden=true href=#9-你现在手上的代码都在做什么和这套思路一一对上>#</a></h1><p>yacc_sql.y：把聚合与 group by 语法接进来，产出 UnboundAggregateExpr、Expression 列表、group_by 列表</p><p>expression.h：定义了所有表达式类型与行为；Resolver 会把 Unbound* 变成 FieldExpr/AggregateExpr；执行时 get_column() 提供列向量</p><p>aggregate_vec_physical_operator.cpp：无分组的聚合算子（一个组 → 一行）</p><p>group_by_vec_physical_operator.h/.cpp（我们补的）：分组聚合算子（多个组 → 多行，靠 AggregateHashTable 聚合）</p><p>aggregate_hash_table.h/.cpp：分组聚合的核心容器（add_chunk 做 build，Scanner 做输出）；你还补了一个标量版本的 LinearProbingAggregateHashTable::add_batch，作为 SIMD 优化的基础版本</p></div><footer class=post-footer><ul class=post-tags></ul></footer></article></main><footer class=footer><span>&copy; 2025 <a href=https://zamaoxiaoji.github.io/>凝紫暮</a></span> ·
+<span>Powered by
+<a href=https://gohugo.io/ rel="noopener noreferrer" target=_blank>Hugo</a> &
+<a href=https://github.com/adityatelange/hugo-PaperMod/ rel=noopener target=_blank>PaperMod</a></span></footer><a href=#top aria-label="go to top" title="Go to Top (Alt + G)" class=top-link id=top-link accesskey=g><svg viewBox="0 0 12 6" fill="currentColor"><path d="M12 6H0l6-6z"/></svg>
+</a><script>let menu=document.getElementById("menu");menu&&(menu.scrollLeft=localStorage.getItem("menu-scroll-position"),menu.onscroll=function(){localStorage.setItem("menu-scroll-position",menu.scrollLeft)}),document.querySelectorAll('a[href^="#"]').forEach(e=>{e.addEventListener("click",function(e){e.preventDefault();var t=this.getAttribute("href").substr(1);window.matchMedia("(prefers-reduced-motion: reduce)").matches?document.querySelector(`[id='${decodeURIComponent(t)}']`).scrollIntoView():document.querySelector(`[id='${decodeURIComponent(t)}']`).scrollIntoView({behavior:"smooth"}),t==="top"?history.replaceState(null,null," "):history.pushState(null,null,`#${t}`)})})</script><script>var mybutton=document.getElementById("top-link");window.onscroll=function(){document.body.scrollTop>800||document.documentElement.scrollTop>800?(mybutton.style.visibility="visible",mybutton.style.opacity="1"):(mybutton.style.visibility="hidden",mybutton.style.opacity="0")}</script><script>document.getElementById("theme-toggle").addEventListener("click",()=>{document.body.className.includes("dark")?(document.body.classList.remove("dark"),localStorage.setItem("pref-theme","light")):(document.body.classList.add("dark"),localStorage.setItem("pref-theme","dark"))})</script></body></html>
